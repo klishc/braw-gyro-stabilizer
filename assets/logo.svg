@@ -1,0 +1,16 @@
+<svg width="512" height="512" viewBox="0 0 300 300" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>BRAW Gyro Stabilizer</title>
+  <desc>A big tilted orange frame with corner shake waves, zoomed around a smaller centered level teal frame, on a dark rounded square.</desc>
+  <rect x="0" y="0" width="300" height="300" rx="66" fill="#16212e"/>
+  <g transform="translate(150 150) scale(1.35) translate(-150 -150)">
+    <g transform="rotate(-15 150 150)">
+      <g fill="none" stroke="#ff9a52" stroke-width="4" stroke-linecap="round">
+        <path d="M0 0 q5 4 0 8 q-5 4 0 8" transform="translate(80 106) rotate(135)"/>
+        <path d="M0 0 q5 4 0 8 q-5 4 0 8" transform="translate(220 106) rotate(-135)"/>
+        <path d="M0 0 q5 4 0 8 q-5 4 0 8" transform="translate(80 194) rotate(45)"/>
+      </g>
+      <rect x="87" y="113" width="126" height="74" rx="9" fill="none" stroke="#ff9a52" stroke-width="7"/>
+    </g>
+    <rect x="105" y="123" width="90" height="54" rx="7" fill="none" stroke="#35d0b6" stroke-width="9"/>
+  </g>
+</svg>

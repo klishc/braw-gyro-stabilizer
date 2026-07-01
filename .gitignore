@@ -1,0 +1,24 @@
+# Build output
+/build/
+*.plugin
+
+# macOS
+.DS_Store
+
+# Editor / IDE
+.vscode/
+.idea/
+*.xcodeproj
+*.xcworkspace
+
+# Plugin runtime artifacts
+*.braw.gyrostab
+brawgyro.log
+
+# CMake leftovers (if generated outside /build)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Packaged installer output
+/dist/
