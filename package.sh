@@ -32,12 +32,28 @@ mkdir -p "${ROOT}/${TARGET}" "${RES}"
 echo "→ Staging payload..."
 cp -R "${PLUGIN}" "${ROOT}/${TARGET}/"
 
+echo "→ Writing preinstall cleanup script..."
+# Remove any previously-installed copy BEFORE extracting the new payload. A pkg install
+# MERGES into an existing bundle (stale files linger if a future version renames or
+# drops one), so a clean delete-then-install guarantees an exact replacement. Also
+# clears the legacy bundle name some early testers have.
+mkdir -p "${WORK}/scripts"
+cat > "${WORK}/scripts/preinstall" <<'SH'
+#!/bin/bash
+MC="/Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore"
+rm -rf "${MC}/BRAWGyroStabilizer.plugin" \
+       "${MC}/GyroStabV4.plugin"
+exit 0
+SH
+chmod +x "${WORK}/scripts/preinstall"
+
 echo "→ Building component package..."
 pkgbuild \
     --root "${ROOT}" \
     --identifier "${IDENTIFIER}" \
     --version "${VERSION}" \
     --install-location "/" \
+    --scripts "${WORK}/scripts" \
     "${WORK}/component.pkg"
 
 echo "→ Writing installer UI (logo + info)..."
