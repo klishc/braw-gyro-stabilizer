@@ -111,6 +111,11 @@ Apply **Video Effects → BRAW Tools → BRAW Gyro Stabilizer** to a BRAW clip a
 reads the gyro and stabilizes on its own. The controls are optional fine-tuning; most of
 the time you'll only reach for **Smoothing**.
 
+<p align="center">
+  <img src="assets/effect-controls.png" width="520"
+       alt="BRAW Gyro Stabilizer — Effect Controls in Premiere Pro">
+</p>
+
 | Control | Default | What it does |
 |---|---|---|
 | **Status row** (top, button) | — | Shows the detected camera — or **`!! NO GYRO DATA IN CLIP !!`** / **`!! UNSUPPORTED FILE !!`**. Press **Check** to refresh. |
