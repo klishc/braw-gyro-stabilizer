@@ -25,7 +25,9 @@ resource 'PiPL' (16000) {
 
         AE_PiPL_Version { 2, 0 },
         AE_Effect_Spec_Version { PF_PLUG_IN_VERSION, PF_PLUG_IN_SUBVERS },
-        AE_Effect_Version { 524289 },               // 1.0.0
+        AE_Effect_Version { 557057 },               // 1.1.0 ((1<<19)|(1<<15)|1). Bumped on
+                                                    // every param-layout change so Premiere
+                                                    // re-registers the definitions.
 
         AE_Effect_Info_Flags { 0 },
         // Must match PF_Cmd_GLOBAL_SETUP in PluginMain.cpp:
@@ -33,7 +35,9 @@ resource 'PiPL' (16000) {
         //              | PF_OutFlag_SEND_UPDATE_PARAMS_UI (0x04000000, for the Status row)
         //   out_flags2 = 0  (legacy PF_Cmd_RENDER path — no smart/GPU render)
         AE_Effect_Global_OutFlags { 0x04000440 },
-        AE_Effect_Global_OutFlags_2 { 0x00000000 },
+        //   out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG (0x8) — honor
+        //   PF_ParamFlag_START_COLLAPSED on topic groups (Debug ships collapsed)
+        AE_Effect_Global_OutFlags_2 { 0x00000008 },
 
         AE_Effect_Match_Name { "io.nk.brawgyrostabilizer" },
         AE_Reserved_Info { 8 }

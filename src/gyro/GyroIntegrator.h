@@ -108,14 +108,24 @@ private:
     int   mFrameWidth  = 0;
     int   mFrameHeight = 0;
 
-    // Clip-wide CONSTANT zoom-to-fill crop, cached. A per-frame adaptive crop "breathes"
-    // with micro-shake (visible jitter); a single crop for the clip never changes →
-    // no breathing. Recomputed when the inputs that affect it change.
+    // Zoom-to-fill crop track, cached: (gyro-time, required border depth per mm of focal),
+    // scanned densely (catches 1–2-frame whips) and slope-limited so the crop relaxes slowly
+    // away from each motion peak — calm sections sit near no-crop, with no visible pumping
+    // (a raw per-frame crop "breathes" with micro-shake; a clip-wide constant over-crops).
+    // Recomputed when the inputs that affect it change.
+    // The border splits into two physically different parts: ROLL (horizon leveling /
+    // roll shake) exposes a focal-INDEPENDENT fraction, while PITCH/YAW border scales
+    // with focal. Storing them separately lets one scan serve every focal of a zoom
+    // clip (a single per-mm model under-cropped the roll part at the wide end → black
+    // corners with Horizon Lock).
     mutable std::mutex mCropMutex;
-    mutable float      mCachedDepthPerFocal = 0.f;  // clip-wide worst border per mm of focal
+    mutable std::vector<double> mCropT;        // sample times (gyro clock)
+    mutable std::vector<float>  mCropRoll;     // roll border fraction (focal-independent)
+    mutable std::vector<float>  mCropPyPerMm;  // pitch/yaw border fraction per mm of focal
     mutable bool       mCropValid      = false;
     mutable float      mKeySmooth      = -1.f;
     mutable float      mKeyHorizon     = -1.f;
+    mutable float      mKeyTilt        = -999.f;
     mutable double     mKeyIn          = -1.0;
     mutable double     mKeyOut         = -1.0;
 };

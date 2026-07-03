@@ -11,7 +11,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VERSION="1.0.0"
+VERSION="1.1.0"
 IDENTIFIER="io.nk.brawgyrostabilizer.installer"
 PLUGIN="${SCRIPT_DIR}/build/BRAWGyroStabilizer.plugin"
 TARGET="Library/Application Support/Adobe/Common/Plug-ins/7.0/MediaCore"

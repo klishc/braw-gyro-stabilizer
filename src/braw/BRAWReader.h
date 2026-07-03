@@ -32,12 +32,13 @@ public:
     // Symmetric (no-lag) temporal smoothing of the focal track, for the digital-scale
     // follow only — rounds the lens's hard zoom start/stop so the auto-crop eases in/out.
     float GetFocalLengthSmoothed(double timeSec, double windowSec) const;
-    // Extra digital zoom (>= 1, clip-normalized so the widest-needed frame = 1) that makes the
-    // APPARENT zoom follow a smoothed focal, easing the lens's hard zoom start/stop. blend 0..1
-    // is the "Scale Follows Zoom" amount; blend 0 (or no track) returns 1.0 (off).
-    float GetZoomEaseScale(double timeSec, double windowSec, float blend) const;
+    // Extra digital zoom (>= 1) that eases the lens zoom, confined to ~leadFrames around each
+    // zoom (crop before a zoom-in, during/after a zoom-out) and 1.0 elsewhere. leadFrames is
+    // driven by "Scale Follows Zoom" (~%/10); leadFrames < 0.5 (or no track) returns 1.0 (off).
+    float GetZoomEaseScale(double timeSec, float leadFrames) const;
     float GetMaxFocalLength()    const;           // longest focal across the clip
-    float GetRollingShutterMs()  const { return mRollingShutterMs; }
+    float GetRollingShutterMs()  const;   // metadata value, or the defaults.ini
+                                          // "rolling_shutter" override when > 0 (hot-reloaded)
     float GetPhotositePitchUm()  const { return mPhotositePitchUm; }  // 0 if unknown
     float GetFrameRate()         const { return mFrameRate; }
     int   GetFrameCount()        const { return mFrameCount; }
@@ -88,13 +89,14 @@ private:
     std::thread         mFocalThread;
     std::vector<std::pair<double,float>> mFocalTrack;   // (timeSec, focalMM), sorted by time
     std::atomic<bool>   mFocalReady{false};
-    // Cache for the clip-wide zoom-ease normalization (min appFocal/actual), keyed by
-    // blend+window so it recomputes only when the control or window changes.
+    // Cached per-sample ease ratio (appFocal/actual) over the whole track, keyed by
+    // blend+window. The zoom-ease normalizes LOCALLY (min ratio within a window around each
+    // frame) so the crop is confined to the zoom and flat regions stay at 1.0.
     mutable std::mutex  mZoomEaseMutex;
     mutable bool        mZoomEaseValid   = false;
     mutable float       mZoomEaseBlend   = -1.f;
     mutable float       mZoomEaseWindow  = -1.f;
-    mutable float       mZoomEaseMinRatio = 1.f;
+    mutable std::vector<std::pair<double,float>> mZoomEaseTrack;  // (timeSec, smoothed ease scale >=1)
     std::string         mLensName;
     std::string         mCameraName;     // camera model (clip metadata, best effort)
     float mSensorCropFactor = 1.f;

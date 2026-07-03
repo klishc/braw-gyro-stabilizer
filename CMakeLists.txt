@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Niko Klishchenko. All rights reserved.
 cmake_minimum_required(VERSION 3.21)
-project(BRAWGyroStabilizer VERSION 1.0.0 LANGUAGES CXX OBJCXX)
+project(BRAWGyroStabilizer VERSION 1.1.0 LANGUAGES CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

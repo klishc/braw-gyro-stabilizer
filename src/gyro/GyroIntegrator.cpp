@@ -183,6 +183,48 @@ void GyroIntegrator::IntegrateGyro()
         mOrientations[i] = (mOrientations[i-1] * delta).normalized();
         mTimestamps[i]   = S[i].timestampSec;
     }
+
+    // ── Anchor the world frame to TRUE gravity ────────────────────────────────
+    // Integration starts at identity, so the "world" above is just the camera's pose at
+    // the FIRST sample — and Horizon Lock levels to that frame's +Y. If the clip starts
+    // with the camera rolled (e.g. a gimbal already mid-move), the "leveled" horizon
+    // inherits that starting tilt for the whole clip. Fix: rotate every accelerometer
+    // sample into the provisional world and AVERAGE — motion acceleration mostly cancels
+    // over the clip while gravity doesn't — then rotate the whole orientation track so
+    // mean gravity lies exactly on +Y (the axis RemoveRoll levels against, matching the
+    // previously-verified convention for clips that start level). Stabilization is
+    // unaffected: its corrections are RELATIVE rotations, so a global re-anchor cancels.
+    {
+        double gw[3] = {0,0,0};
+        size_t used = 0;
+        for (size_t i = 0; i < N; ++i) {
+            const float ax = S[i].ax, ay = S[i].ay, az = S[i].az;
+            if (ax*ax + ay*ay + az*az < 1e-6f) continue;       // accel stream missing/empty
+            Quat p{0, ax, ay, az};
+            Quat r = (mOrientations[i] * p) * mOrientations[i].conjugate();
+            gw[0] += r.x; gw[1] += r.y; gw[2] += r.z; ++used;
+        }
+        const double len = std::sqrt(gw[0]*gw[0] + gw[1]*gw[1] + gw[2]*gw[2]);
+        if (used > N / 4 && len > 1e-6) {
+            gw[0] /= len; gw[1] /= len; gw[2] /= len;
+            const double d = gw[1];                            // gw · (0,1,0)
+            Quat A{1,0,0,0};
+            if (d < -0.99999) {
+                A = Quat{0, 1, 0, 0};                          // upside-down start: 180° about X
+            } else if (d < 0.99999) {
+                double axv[3] = { -gw[2], 0.0, gw[0] };        // gw × (0,1,0)
+                const double al = std::sqrt(axv[0]*axv[0] + axv[1]*axv[1] + axv[2]*axv[2]);
+                if (al > 1e-9) {
+                    const double ang = std::acos(std::max(-1.0, std::min(1.0, d)));
+                    const double s   = std::sin(ang * 0.5) / al;
+                    A = Quat{ (float)std::cos(ang * 0.5),
+                              (float)(axv[0] * s), (float)(axv[1] * s), (float)(axv[2] * s) };
+                }
+            }
+            for (size_t i = 0; i < N; ++i)
+                mOrientations[i] = (A * mOrientations[i]).normalized();
+        }
+    }
 }
 
 // ── Interpolate orientation at arbitrary time ─────────────────────────────────
@@ -510,13 +552,19 @@ WarpMap GyroIntegrator::ComputeWarpMap(
     // moments crop in. To avoid the zoom "pumping" frame-to-frame we take the worst
     // (smallest) required crop over the clip, giving one steady envelope.
     float crop = 1.0f;
+    float dbgRoll = 0.f, dbgPyMm = 0.f;   // diagnostics for the CROP log line below
     if (params.zoomToFill) {
-        // CONSTANT clip-wide zoom (DaVinci-style): the crop is the deepest zoom ANY frame in
-        // the clip needs, applied to every frame. A per-frame adaptive crop "breathes" with
-        // micro-shake (the jitter the user saw only with Zoom to Fill on); a single constant
-        // crop never changes → zero breathing. Computed once and cached; recomputed only when
-        // smoothing / horizon / in-out change. Crop is a resolution-independent fraction, so
-        // caching across render resolutions is fine.
+        // LOCAL zoom-to-fill with plateaus. The old clip-wide constant crop (worst case
+        // applied to every frame) over-cropped calm sections badly, and its sparse 0.2s scan
+        // MISSED 1–3-frame whips (little black corners on hits). Pipeline:
+        //   (1) scan the required border DENSELY (~24/s, catches single-frame spikes),
+        //   (2) slope-limit into a peak envelope (crop moves at most ~2%/s),
+        //   (3) hysteresis: HOLD the crop flat through sub-1% wiggles (micro-shake made a
+        //       tracking crop pump visibly on calm shots, worst at low Smoothing), releasing
+        //       only when there is real frame area to win,
+        //   (4) light smoothing to round the plateau corners, (5) re-assert coverage.
+        //   Per frame, interpolate the cached track. Depth is stored per mm of focal
+        //   (border ∝ focal), so the track is focal-independent — no re-scan on zooms.
         const float  hardMax   = 0.5f;      // never crop below 0.5 (2× max zoom)
         const float  scanFocal = std::max(1.0f, params.focalLengthMM);
 
@@ -530,44 +578,122 @@ WarpMap GyroIntegrator::ComputeWarpMap(
         const bool match = mCropValid
             && mKeySmooth  == params.smoothingWindowSec
             && mKeyHorizon == params.horizonStrength
+            && mKeyTilt    == params.horizonTiltRad
             && mKeyIn      == t0
             && mKeyOut     == t1;
         if (!match) {
-            float minR = 1.0f;
-            // Sample the range but CAP at ~120 points, so the scan cost is bounded no matter
-            // how long the clip is (120 points still catches the motion peaks).
+            // Dense scan: ~24 samples/s (fine enough for a 1-frame whip at 24fps), capped at
+            // 600 samples so the rebuild stays fast when scrubbing the Smoothing slider —
+            // clips up to ~25s get full per-frame density; longer ones degrade gracefully.
             const double span = std::max(0.0, t1 - t0);
-            const double cropStep = std::max(0.2, span / 120.0);
+            const double cropStep = std::max(0.042, span / 600.0);
+            // (1) dense required border, SPLIT into a roll part (in-plane rotation border —
+            //     focal-INDEPENDENT; this is what Horizon Lock produces) and the pitch/yaw
+            //     remainder (border ∝ focal). A single per-mm model reconstructed the roll
+            //     border ∝ focal too, under-cropping the wide end of zoom clips → the black
+            //     corners seen with Horizon Lock 100 on a 24–70 clip.
+            std::vector<double> tt;
+            std::vector<float>  reqRoll, reqPy;
+            tt.reserve((size_t)(span / cropStep) + 2);
+            reqRoll.reserve(tt.capacity());  reqPy.reserve(tt.capacity());
+            const float W = (float)std::max(1, renderWidth), Hh = (float)std::max(1, renderHeight);
             for (double ts = t0; ts <= t1; ts += cropStep) {
-                float r = RequiredCrop(ts, desiredAt(ts), rsDuration, fx, fy, cx, cy,
-                                       renderWidth, renderHeight);
-                minR = std::min(minR, r);
+                const Quat dq   = desiredAt(ts);
+                const float full = 1.0f - RequiredCrop(ts, dq, rsDuration, fx, fy, cx, cy,
+                                                       renderWidth, renderHeight);
+                // Roll (twist about the optical axis) of the correction, and the border a
+                // pure central rotation by that angle exposes (largest same-aspect rect).
+                const Quat corr = (OrientationAt(ts).conjugate() * dq).normalized();
+                const float tw  = 2.0f * std::atan2(corr.z, corr.w);
+                const float ca  = std::fabs(std::cos(tw)), sa = std::fabs(std::sin(tw));
+                const float sRoll = std::min(1.0f, std::min(1.0f / (ca + sa * Hh / W),
+                                                            1.0f / (sa * W / Hh + ca)));
+                const float rollF = std::min(full, 1.0f - sRoll);
+                tt.push_back(ts);
+                reqRoll.push_back(rollF);
+                reqPy.push_back(std::max(0.0f, full - rollF));
             }
-            // Worst exposed-border DEPTH per mm of focal. Border ∝ focal, so dividing out the
-            // scan focal makes this focal-INDEPENDENT (no need to re-scan when the zoom moves).
-            mCachedDepthPerFocal = (1.0f - minR) / scanFocal;
+            const size_t N = tt.size();
+            // (2)-(5) shape each component: slope-limited peak envelope (crop moves ≤ `rate`
+            // of the frame per second) → HYSTERESIS plateaus (hold flat through sub-`hys`
+            // wiggles — micro-shake made a tracking crop pump visibly on calm footage, worst
+            // at low Smoothing; release only when real frame area is recoverable) → light
+            // triangular smoothing to round plateau corners → re-assert coverage.
+            const float rate = 0.02f;                     // frame-fraction per second
+            const float hys  = 0.010f;                    // 1% of frame dead-band
+            const int   hw   = std::max(1, (int)std::lround(0.3 / cropStep));
+            auto shape = [&](std::vector<float>& v) {
+                const std::vector<float> orig = v;
+                for (size_t i = 1; i < N; ++i) {
+                    const float dt = (float)(tt[i] - tt[i-1]);
+                    v[i] = std::max(v[i], v[i-1] - rate * dt);
+                }
+                for (size_t i = N; i-- > 1; ) {
+                    const float dt = (float)(tt[i] - tt[i-1]);
+                    v[i-1] = std::max(v[i-1], v[i] - rate * dt);
+                }
+                std::vector<float> flat(N);
+                float P = (N > 0) ? v[0] : 0.f;
+                for (size_t i = 0; i < N; ++i) {
+                    const float dt = (i > 0) ? (float)(tt[i] - tt[i-1]) : 0.f;
+                    if (v[i] >= P)            P = v[i];
+                    else if (P - v[i] > hys)  P = std::max(v[i] + 0.5f * hys, P - rate * dt);
+                    flat[i] = P;
+                }
+                for (size_t i = 0; i < N; ++i) {
+                    double s = 0.0, w = 0.0;
+                    for (int d = -hw; d <= hw; ++d) {
+                        const long k = (long)i + d;
+                        if (k < 0 || k >= (long)N) continue;
+                        const double ww = 1.0 - (double)std::abs(d) / (hw + 1);
+                        s += ww * flat[(size_t)k]; w += ww;
+                    }
+                    v[i] = std::max(orig[i], (float)(w > 0.0 ? s / w : flat[i]));
+                }
+            };
+            shape(reqRoll);
+            shape(reqPy);
+            mCropT    = std::move(tt);
+            mCropRoll = std::move(reqRoll);
+            mCropPyPerMm.assign(N, 0.f);
+            for (size_t i = 0; i < N; ++i) mCropPyPerMm[i] = reqPy[i] / scanFocal;
             mCropValid  = true;
             mKeySmooth  = params.smoothingWindowSec;
             mKeyHorizon = params.horizonStrength;
+            mKeyTilt    = params.horizonTiltRad;
             mKeyIn      = t0;
             mKeyOut     = t1;
         }
+        // Interpolate both components at this frame's (gyro-time) position and recombine:
+        // roll border is focal-independent; pitch/yaw border scales with the APPARENT
+        // (eased) focal — the eased focal is smooth and >= raw, so borders stay hidden
+        // while the crop can't inherit the lens's hard stops.
+        float rollFrac = 0.f, pyPerMm = 0.f;
+        if (!mCropT.empty()) {
+            const auto& T = mCropT;
+            size_t lo = 0; float a = 0.f;
+            if      (frameCenterTimeSec <= T.front()) { lo = 0;            a = 0.f; }
+            else if (frameCenterTimeSec >= T.back())  { lo = T.size() - 1; a = 0.f; }
+            else {
+                size_t hi = T.size() - 1;
+                while (hi - lo > 1) { size_t m = (lo + hi) / 2;
+                                      if (T[m] <= frameCenterTimeSec) lo = m; else hi = m; }
+                const double sp = T[lo+1] - T[lo];
+                a = (sp > 1e-9) ? (float)((frameCenterTimeSec - T[lo]) / sp) : 0.f;
+            }
+            const size_t hi2 = std::min(lo + 1, T.size() - 1);
+            rollFrac = mCropRoll[lo]    + a * (mCropRoll[hi2]    - mCropRoll[lo]);
+            pyPerMm  = mCropPyPerMm[lo] + a * (mCropPyPerMm[hi2] - mCropPyPerMm[lo]);
+        }
+        dbgRoll = rollFrac;  dbgPyMm = pyPerMm;
+        const float easeS = std::max(1.0f, params.zoomEaseScale);
+        float frac = rollFrac + pyPerMm * (params.focalLengthMM * easeS);
         // Extra Scale scales the border DEPTH, so the added zoom is proportional to how much
-        // we're already cropping — largest at the deepest-crop (longest-focal / worst) frames,
-        // ~nothing where the crop is shallow — instead of a flat pad on every frame.
-        const float depthEff = mCachedDepthPerFocal * (1.0f + std::max(0.0f, params.extraCropFrac));
-
-        // Two crops: ADAPTIVE follows this frame's focal (the scale tracks the lens); CONSTANT
-        // uses the clip's longest focal so it never changes (steady, but over-zooms the wide
-        // end). Blended by zoomSteadiness (only differs on a zoom lens): 0 = adaptive, 1 =
-        // constant. (The visible zoom-motion easing is applied separately below, via
-        // zoomEaseScale — this part is only the stabilization border-hiding zoom.)
-        const float maxFocal = std::max(params.maxFocalLengthMM, params.focalLengthMM);
-        const float adaptiveCrop = 1.0f - depthEff * params.focalLengthMM;
-        const float constantCrop = 1.0f - depthEff * maxFocal;
-        const float s = std::min(1.0f, std::max(0.0f, params.zoomSteadiness));
-        crop = adaptiveCrop * (1.0f - s) + constantCrop * s;
-        crop = std::min(1.0f, std::max(hardMax, crop));
+        // we're already cropping — largest at the deepest-crop (worst) moments, ~nothing where
+        // the crop is shallow — instead of a flat pad on every frame.
+        frac *= (1.0f + std::max(0.0f, params.extraCropFrac));
+        crop  = 1.0f - frac;
+        crop  = std::min(1.0f, std::max(hardMax, crop));
     }
     else if (params.extraCropFrac > 0.f) {
         // Scale to Fill is off, but Extra Scale still applies as a plain manual zoom (so the
@@ -575,25 +701,33 @@ WarpMap GyroIntegrator::ComputeWarpMap(
         crop = std::max(0.5f, 1.0f - params.extraCropFrac);
     }
 
-    // Zoom-motion easing ("Scale Follows Zoom"): an extra digital zoom so the APPARENT focal
-    // follows a smoothed curve, decelerating the lens's hard zoom start/stop instead of
-    // snapping. The caller passes a clip-normalized scale (>= 1, with the widest-needed frame
-    // at exactly 1), so this only ever zooms IN — it never exposes new border on top of the
-    // stabilization crop. The cost is a small constant extra zoom (the headroom the ease needs).
+    // Zoom-motion easing ("Scale Follows Zoom"): apply EXACTLY the per-frame digital zoom that
+    // makes the apparent focal follow the smooth upper envelope of the lens focal — rounding
+    // the lens's hard zoom start/stop while preserving the zoom itself. The ease is >= 1 and
+    // returns to exactly 1 in flat regions (no cushion), so smooth/slow zooms without hard
+    // stops get essentially nothing.
+    //
+    // Deliberately NO budget cap or soft-knee here: any limiter breaks the apparent-zoom
+    // velocity mid-move (the "zooms, stalls, zooms again" pulse). The stabilizer's own 2x
+    // (hardMax=0.5) floor applies to the stabilization crop only, NOT to this ease — a crash
+    // zoom may momentarily crop past 2x, costing resolution on those few motion-blurred frames,
+    // which is the honest price of smoothing it. A 4x floor remains as pure sanity against
+    // pathological focal metadata (normal zooms never reach it).
     if (params.zoomEaseScale > 1.0001f) {
-        crop = std::min(1.0f, std::max(0.5f, crop / params.zoomEaseScale));
+        crop = std::max(0.25f, crop / params.zoomEaseScale);
     }
 
-    {   // Diagnostic: log the computed crop per frame (time-change gated) to see whether
-        // the "zoom jitter" is the crop pumping vs. a residual-stabilization/focal issue.
+    if (FILE* f = dbg::open()) {   // only when Debug Logging is ON (so the budget below isn't
+        // spent while logging is off). Per-frame crop/focal/zoomEase, time-change gated.
         static double sLastTc = -1e9; static int sCdbg = 0;
-        if (std::fabs(frameCenterTimeSec - sLastTc) > 1e-4 && sCdbg < 80) {
+        if (std::fabs(frameCenterTimeSec - sLastTc) > 1e-4 && sCdbg < 600) {
             ++sCdbg; sLastTc = frameCenterTimeSec;
-            FILE* f = dbg::open();
-            if (f) { std::fprintf(f, "CROP t=%.3f crop=%.4f focal=%.1f horizonStr=%.3f\n",
-                                  frameCenterTimeSec, crop, params.focalLengthMM,
-                                  params.horizonStrength); std::fclose(f); }
+            std::fprintf(f, "CROP t=%.3f crop=%.4f focal=%.1f zoomEase=%.4f horizonStr=%.3f"
+                            " roll=%.4f pyMm=%.5f\n",
+                         frameCenterTimeSec, crop, params.focalLengthMM,
+                         params.zoomEaseScale, params.horizonStrength, dbgRoll, dbgPyMm);
         }
+        std::fclose(f);
     }
 
     WarpMap wm;

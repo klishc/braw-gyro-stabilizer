@@ -29,6 +29,145 @@
 #include <cstdarg>
 #include <cctype>
 #include <algorithm>
+#include <cstdlib>
+#include <thread>
+#include <sys/stat.h>
+
+// ── User default parameter values ("Save as default" button) ──────────────────
+// A plain, hand-editable INI at ~/Library/Application Support/BRAWGyroStabilizer/
+// defaults.ini. It's read in ParamsSetup so every NEWLY-applied instance starts from
+// these values (missing keys fall back to the compiled kDefault* constants), and the
+// "Save as default" button writes the current clip's values back to it. Existing clips
+// are unaffected. Single active profile — for multiple named profiles use Premiere presets.
+namespace {
+struct ParamDefaults {
+    float smoothing      = kDefaultSmoothing;
+    float focal          = kDefaultFocalLength;
+    float horizonAmt     = kDefaultHorizonAmount;
+    float horizonTilt    = kDefaultHorizonTilt;
+    int   scaleToFill    = kDefaultScaleToFill;
+    float scaleFollows   = kDefaultScaleFollowsZoom;
+    float extraScale     = kDefaultExtraScale;
+    float rollingShutter = kDefaultRollingShutter;
+    int   debugLog       = kDefaultDebugLog;
+    float zoomSyncFrames = 1.2f;   // zoom-ease ↔ picture sync offset (frames); read hot by
+                                   // BRAWReader::ZoomSyncOffsetFrames, preserved on save
+};
+std::string DefaultsDir() {
+    const char* home = std::getenv("HOME");
+    return std::string(home ? home : "/tmp") + "/Library/Application Support/BRAWGyroStabilizer";
+}
+std::string DefaultsFile() { return DefaultsDir() + "/defaults.ini"; }
+
+void LoadDefaults(ParamDefaults& d) {
+    FILE* f = std::fopen(DefaultsFile().c_str(), "r");
+    if (!f) return;                                   // no file → compiled defaults
+    auto clampf = [](double v, float lo, float hi) {
+        if (!(v == v)) return lo;                     // NaN guard
+        return (float)std::min((double)hi, std::max((double)lo, v));
+    };
+    char line[256], key[64];
+    double val;
+    while (std::fgets(line, sizeof line, f)) {
+        if (std::sscanf(line, " %63[a-z_] = %lf", key, &val) != 2) continue;  // skips comments/blanks/junk
+        std::string k = key;
+        // Clamp every value to its parameter's range — a hand-edited (or corrupted) file
+        // must never feed an out-of-range default into a slider.
+        if      (k == "smoothing")          d.smoothing      = clampf(val,   0.f, 100.f);
+        else if (k == "focal_override")     d.focal          = clampf(val,   0.f, 300.f);
+        else if (k == "horizon_lock")       d.horizonAmt     = clampf(val,   0.f, 100.f);
+        else if (k == "horizon_tilt")       d.horizonTilt    = clampf(val, -45.f,  45.f);
+        else if (k == "scale_to_fill")      d.scaleToFill    = (val != 0.0) ? 1 : 0;
+        else if (k == "scale_follows_zoom") d.scaleFollows   = clampf(val,   0.f, 100.f);
+        else if (k == "extra_scale")        d.extraScale     = clampf(val,   0.f,  50.f);
+        else if (k == "rolling_shutter")    d.rollingShutter = clampf(val,   0.f,  50.f);
+        else if (k == "debug_log")          d.debugLog       = (val != 0.0) ? 1 : 0;
+        else if (k == "zoom_sync_offset_frames") d.zoomSyncFrames = clampf(val, -10.f, 10.f);
+    }
+    std::fclose(f);
+}
+bool SaveDefaults(const ParamDefaults& d) {
+    ::mkdir(DefaultsDir().c_str(), 0755);   // ~/Library/Application Support already exists
+    FILE* f = std::fopen(DefaultsFile().c_str(), "w");
+    if (!f) return false;
+    std::fprintf(f,
+        "# BRAW Gyro Stabilizer default parameter values.\n"
+        "# Applied to each NEW effect instance. Edit by hand, or re-save from the effect.\n"
+        "smoothing = %.1f\n"
+        "focal_override = %.1f\n"
+        "horizon_lock = %.1f\n"
+        "horizon_tilt = %.2f\n"
+        "scale_to_fill = %d\n"
+        "scale_follows_zoom = %.1f\n"
+        "extra_scale = %.1f\n"
+        "rolling_shutter = %.2f\n"
+        "debug_log = %d\n"
+        "# Zoom-ease vs picture sync (frames): positive = focal metadata leads the picture.\n"
+        "# Hot-reloaded — edit, save, and nudge any effect param to re-render. No restart.\n"
+        "zoom_sync_offset_frames = %.1f\n",
+        d.smoothing, d.focal, d.horizonAmt, d.horizonTilt, d.scaleToFill,
+        d.scaleFollows, d.extraScale, d.rollingShutter, d.debugLog, d.zoomSyncFrames);
+    std::fclose(f);
+    return true;
+}
+// ── Update check (GitHub releases) ─────────────────────────────────────────────
+// Runs ONLY when the user clicks the button — the plugin never phones home on its own.
+// The fetch runs on a DETACHED thread (a synchronous request could hang Premiere's UI
+// thread, and Premiere suites must not be touched off-thread), writing its result into
+// gUpdLabel; RefreshStatusLabel pushes it into the button label on the next panel
+// refresh / click. Uses macOS's bundled curl — no extra dependencies.
+std::mutex  gUpdMutex;
+std::string gUpdLabel;              // empty until a check has been started
+bool        gUpdRunning = false;
+
+bool ParseVer(const char* s, int v[3]) {
+    while (*s && !std::isdigit((unsigned char)*s)) ++s;   // skip a leading "v"
+    return std::sscanf(s, "%d.%d.%d", &v[0], &v[1], &v[2]) == 3;
+}
+
+void StartUpdateCheck() {
+    {
+        std::lock_guard<std::mutex> lk(gUpdMutex);
+        if (gUpdRunning) return;
+        gUpdRunning = true;
+        gUpdLabel   = "Checking...";
+    }
+    std::thread([] {
+        std::string tag;
+        FILE* p = ::popen("/usr/bin/curl -s --max-time 5 -H 'User-Agent: BRAWGyroStabilizer' "
+                          "https://api.github.com/repos/klishc/braw-gyro-stabilizer/releases/latest",
+                          "r");
+        if (p) {
+            char buf[512]; std::string out;
+            while (std::fgets(buf, sizeof buf, p)) { out += buf; if (out.size() > 65536) break; }
+            ::pclose(p);
+            if (const char* c = std::strstr(out.c_str(), "\"tag_name\"")) {
+                c = std::strchr(c + 10, ':');
+                if (c) c = std::strchr(c, '"');
+                if (c) {
+                    const char* e = std::strchr(++c, '"');
+                    if (e && e - c < 32) tag.assign(c, e);
+                }
+            }
+        }
+        std::string label;
+        int rv[3], lv[3];
+        if (!tag.empty() && ParseVer(tag.c_str(), rv) && ParseVer(kPluginVersionStr, lv)) {
+            const bool newer = (rv[0] != lv[0]) ? rv[0] > lv[0]
+                             : (rv[1] != lv[1]) ? rv[1] > lv[1]
+                             :                    rv[2] > lv[2];
+            label = newer ? (tag + " is out - see GitHub")
+                          : ("Up to date (v" + std::string(kPluginVersionStr) + ")");
+        } else {
+            label = "Check failed (offline?)";
+        }
+        if (label.size() > 31) label.resize(31);
+        std::lock_guard<std::mutex> lk(gUpdMutex);
+        gUpdLabel   = label;
+        gUpdRunning = false;
+    }).detach();
+}
+} // namespace
 
 // ── Lightweight file logger (Premiere swallows stdout; this gives us ground truth)
 static void GyroLog(const char* fmt, ...)
@@ -233,7 +372,9 @@ static PF_Err GlobalSetup(PF_InData* in_data, PF_OutData* out_data)
     out_data->out_flags  = PF_OutFlag_PIX_INDEPENDENT |
                            PF_OutFlag_USE_OUTPUT_EXTENT |
                            PF_OutFlag_SEND_UPDATE_PARAMS_UI;
-    out_data->out_flags2 = 0;
+    // PARAM_GROUP_START_COLLAPSED makes Premiere honor PF_ParamFlag_START_COLLAPSED on
+    // topic groups (the Debug group ships collapsed). Must match the PiPL's OutFlags_2.
+    out_data->out_flags2 = PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG;
 
     // For Premiere, declare the pixel formats we support (AE-compat PF suite).
     if (in_data->appl_id == 'PrMr' && in_data->pica_basicP) {
@@ -262,6 +403,11 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     PF_Err      err = PF_Err_NONE;
     PF_ParamDef def;   // referenced by name inside the PF_ADD_* macros
 
+    // Load user defaults (if any) so each newly-applied instance starts from the saved
+    // values. Missing file / keys → the compiled kDefault* constants (the struct's inits).
+    ParamDefaults ud;
+    LoadDefaults(ud);
+
     // ── "Check support" button (FIRST, so it sits at the top of Effect Controls) ──
     // A momentary button. Its left-hand LABEL (the param name) shows the detected camera
     // or "Unsupported file" / "No gyro data". Clicking the button fires
@@ -276,66 +422,89 @@ static PF_Err ParamsSetup(PF_InData* in_data, PF_OutData* out_data)
     // Param 2: Smoothing (%). Mapped to a seconds-sigma by a square curve (SmoothingPctToSigma)
     // so sensitivity is even across the slider (the old 0–10s scale crammed all the change into
     // 0–0.5s and was dead 5–10s). 0 = none (rolling-shutter only), 100 = very smooth.
-    PF_ADD_FLOAT_SLIDERX("Smoothing (%) [0 = rolling-shutter fix only]",
-                         0.0f, 100.0f, 0.0f, 100.0f, kDefaultSmoothing,
+    // NOTE: Premiere truncates param names (hard cap 31 chars, display even less) and has NO
+    // static-text rows — every row is a control. So names stay short; behaviour details
+    // (e.g. "0 = rolling-shutter fix only") are documented in the README's controls table.
+    PF_ADD_FLOAT_SLIDERX("Smoothing (%)",
+                         0.0f, 100.0f, 0.0f, 100.0f, ud.smoothing,
                          PF_Precision_INTEGER, 0, 0, kParamSmoothingStrength);
 
     // Param 3: Focal Length Override (mm) — important, so it's near the top. 0 = auto (read
     // per-frame from the .braw, tracks zoom). Set a value only if the auto focal is wrong.
-    PF_ADD_FLOAT_SLIDERX("Focal Length Override (mm) [0=auto]",
-                         0.0f, 300.0f, 0.0f, 135.0f, kDefaultFocalLength,
+    PF_ADD_FLOAT_SLIDERX("Focal Override (mm) [0=auto]",
+                         0.0f, 300.0f, 0.0f, 135.0f, ud.focal,
                          PF_Precision_INTEGER, 0, 0, kParamFocalLength);
 
-    // Param 4: Horizon Lock (%) — leveling strength; 0 = off, 100 = fully level.
-    PF_ADD_FLOAT_SLIDERX("Horizon Lock (%) [0=off]",
-                         0.0f, 100.0f, 0.0f, 100.0f, kDefaultHorizonAmount,
+    // ── Horizon group (collapsible header in Effect Controls) ──────────────
+    // The topic start/end are params too and occupy indices 4 and 7 — the GPU path reads
+    // params by position, so the enum in PluginMain.h counts them.
+    PF_ADD_TOPIC("Horizon", kParamHorizonGroup);
+
+    // Param 5: Lock (%) — leveling strength; 0 = off, 100 = fully level.
+    PF_ADD_FLOAT_SLIDERX("Lock (%) [0=off]",
+                         0.0f, 100.0f, 0.0f, 100.0f, ud.horizonAmt,
                          PF_Precision_INTEGER, 0, 0, kParamHorizonAmount);
 
-    // Param 5: Horizon Tilt (°) — angle the horizon lock holds; 0 = level, ± tilts it.
-    // Only has effect when Horizon Lock > 0.
-    PF_ADD_FLOAT_SLIDERX("Horizon Tilt (deg)",
-                         -45.0f, 45.0f, -45.0f, 45.0f, kDefaultHorizonTilt,
+    // Param 6: Tilt (°) — angle the horizon lock holds; 0 = level, ± tilts it.
+    // Only has effect when Lock > 0.
+    PF_ADD_FLOAT_SLIDERX("Tilt (deg)",
+                         -45.0f, 45.0f, -45.0f, 45.0f, ud.horizonTilt,
                          PF_Precision_TENTHS, 0, 0, kParamHorizonTilt);
 
-    // Param 6: Scale to Fill — auto DIGITAL scaling to hide the borders the stabilization
-    // exposes. The crop amount is computed automatically.
-    PF_ADD_CHECKBOXX("Scale to Fill (auto)", kDefaultScaleToFill, 0, kParamScaleToFill);
+    PF_END_TOPIC(kParamHorizonGroupEnd);
 
-    // Param 7: Scale Follows Zoom (%) — ONLY affects zoom-lens footage (focal changes mid-shot).
-    // Digitally eases the zoom MOTION so a jerky or hard-stopping hand-zoom looks smooth
-    // (motorized): the apparent focal follows a temporally-smoothed curve (drives
-    // sp.zoomEaseScale in GyroIntegrator, fed by BRAWReader::GetZoomEaseScale). 0 = off (raw
-    // zoom); 100 = full smoothing. Costs a small constant zoom-in as the ease headroom. On a
-    // fixed-focal lens the focal never changes, so this does nothing.
-    PF_ADD_FLOAT_SLIDERX("Scale Follows Zoom (%) [zoom lenses]",
-                         0.0f, 100.0f, 0.0f, 100.0f, kDefaultScaleFollowsZoom,
+    // ── Scale group (expanded by default — no START_COLLAPSED flag) ─────────
+    PF_ADD_TOPIC("Scale", kParamScaleGroup);
+
+    // Param 9: Scale to Fill — auto DIGITAL scaling to hide the borders the stabilization
+    // exposes. The crop amount is computed automatically.
+    PF_ADD_CHECKBOXX("Scale to Fill (auto)", ud.scaleToFill, 0, kParamScaleToFill);
+
+    // Param 10: Scale Follows Zoom (%) — ONLY affects zoom-lens footage (focal changes
+    // mid-shot). Digitally eases the zoom MOTION so a jerky or hard-stopping hand-zoom looks
+    // smooth: the apparent focal follows the smooth upper envelope of the lens focal (drives
+    // sp.zoomEaseScale, fed by BRAWReader::GetZoomEaseScale). 0 = off (default); ~25 is a good
+    // working value; the lead is capped so high values can't reach the pulsing zone.
+    PF_ADD_FLOAT_SLIDERX("Scale Follows Zoom (%)",
+                         0.0f, 100.0f, 0.0f, 100.0f, ud.scaleFollows,
                          PF_Precision_INTEGER, 0, 0, kParamScaleFollowsZoom);
 
-    // Param 8: Extra Scale (%) — manual digital zoom on top of the (exact) auto-crop. It scales
-    // with how deep the crop already is, so it adds at the worst/peak frames rather than flat
-    // everywhere. Works even with Scale to Fill off (then it's a plain manual zoom).
+    // Param 11: Extra Scale (%) — manual digital zoom on top of the (exact) auto-crop. It
+    // scales with how deep the crop already is, so it adds at the worst/peak frames rather
+    // than flat everywhere. Works even with Scale to Fill off (then it's a plain manual zoom).
     PF_ADD_FLOAT_SLIDERX("Extra Scale (%)",
-                         0.0f, 50.0f, 0.0f, 50.0f, kDefaultExtraScale,
+                         0.0f, 50.0f, 0.0f, 50.0f, ud.extraScale,
                          PF_Precision_INTEGER, 0, 0, kParamExtraScale);
 
-    // ── Override (leave at 0/auto unless the metadata is wrong) ────────────
-    // Param 9: Rolling Shutter Override (ms) — the sensor's full readout time used for the
-    // per-scanline correction. 0 = auto (from BRAW `sensor_line_time`). Set a value only to
-    // override the auto-detected readout.
-    PF_ADD_FLOAT_SLIDERX("Rolling Shutter Override (ms) [0=auto]",
-                         0.0f, 50.0f, 0.0f, 50.0f, kDefaultRollingShutter,
-                         PF_Precision_TENTHS, 0, 0, kParamRollingShutter);
+    PF_END_TOPIC(kParamScaleGroupEnd);
 
-    // Param 10: Debug Logging — when on, writes /tmp/brawgyro.log (off = nothing written).
-    PF_ADD_CHECKBOXX("Debug Logging", kDefaultDebugLog, 0, kParamDebugLog);
+    // (Rolling Shutter Override was removed from the UI — set "rolling_shutter" in
+    // defaults.ini instead; BRAWReader::GetRollingShutterMs applies it. 0 = auto.)
 
-    // ── Render-path row (read-only, LAST) ──────────────────────────────────────
-    // Param 11: a "Check" button whose left LABEL shows which render path is active
-    // (GPU Metal vs CPU software). Like the Status button it's UI-only — the GPU never
-    // reads it, and it's appended last so it can't shift the indices 1..10 the GPU reads.
+    // ── Debug group (ships COLLAPSED — needs PF_OutFlag2_PARAM_GROUP_START_COLLAPSED_FLAG,
+    //    set in GlobalSetup and the PiPL) ─────────────────────────────────────
+    PF_ADD_TOPICX("Debug", PF_ParamFlag_START_COLLAPSED, kParamDebugGroup);
+
+    // Param 14: Debug Logging — when on, writes /tmp/brawgyro.log (off = nothing written).
+    PF_ADD_CHECKBOXX("Debug Logging", ud.debugLog, 0, kParamDebugLog);
+
+    // Param 15: Render-path row (read-only): a "Check" button whose left LABEL shows which
+    // render path is active (GPU Metal vs CPU software). UI-only — the GPU never reads it.
     PF_ADD_BUTTON(kRenderPathDefault, "Check", 0, PF_ParamFlag_SUPERVISE, kParamRenderPath);
 
-    out_data->num_params = 12;   // input layer (0) + status + 9 controls + render-path
+    // Param 16: Update check — on click (and ONLY on click; the plugin never phones home on
+    // its own) an async thread asks GitHub for the latest release tag; the label shows
+    // "Checking…" then the result on the next panel refresh.
+    PF_ADD_BUTTON(kCheckUpdateDefault, "Check", 0, PF_ParamFlag_SUPERVISE, kParamCheckUpdate);
+
+    PF_END_TOPIC(kParamDebugGroupEnd);
+
+    // Param 17: "Save as default" button — writes the CURRENT clip's values to defaults.ini so
+    // every newly-applied instance starts from them. UI-only (the GPU never reads it); appended
+    // LAST so it can't shift the indices the GPU reads.
+    PF_ADD_BUTTON("Save settings", "Save", 0, PF_ParamFlag_SUPERVISE, kParamSaveDefault);
+
+    out_data->num_params = 19;   // input + 18 above (incl. the three groups' start/end rows)
     return err;
 }
 
@@ -407,8 +576,8 @@ static void RefreshStatusLabel(PF_InData* in_data, PF_ParamDef* params[])
     if (!found)                                 text = "Play clip, then Check";
     else switch (st.state) {
         case statusstore::Ok:          text = st.camera.empty() ? "BRAW gyro ready" : st.camera.c_str(); break;
-        case statusstore::NoGyro:      text = "No gyro data in clip"; break;
-        case statusstore::Unsupported: text = "Unsupported file"; break;
+        case statusstore::NoGyro:      text = "!! NO GYRO DATA IN CLIP !!"; break;
+        case statusstore::Unsupported: text = "!! UNSUPPORTED FILE !!"; break;
         default:                       text = kStatusDefault; break;
     }
     SetButtonLabel(in_data, params, kParamStatus, text);
@@ -419,6 +588,13 @@ static void RefreshStatusLabel(PF_InData* in_data, PF_ParamDef* params[])
     if (pathLabel.size() > 31) pathLabel.resize(31);
     SetButtonLabel(in_data, params, kParamRenderPath, pathLabel.c_str());
 
+    // (3) Update-check result (only once a check has been started).
+    {
+        std::lock_guard<std::mutex> lk(gUpdMutex);
+        if (!gUpdLabel.empty())
+            SetButtonLabel(in_data, params, kParamCheckUpdate, gUpdLabel.c_str());
+    }
+
     GyroLog("RefreshStatusLabel: own='%s' key='%s' found=%d state=%d status='%s' render='%s'",
             own.c_str(), key.c_str(), (int)found, found ? (int)st.state : -1, text, path.c_str());
 }
@@ -428,6 +604,30 @@ static PF_Err UpdateParamsUI(PF_InData* in_data, PF_OutData* /*out_data*/,
                              PF_ParamDef* params[])
 {
     RefreshStatusLabel(in_data, params);
+    return PF_Err_NONE;
+}
+
+// "Save as default" button: capture the current clip's parameter values into defaults.ini.
+// New instances start from these (loaded in ParamsSetup); existing clips are untouched.
+static PF_Err SaveDefaultsFromParams(PF_InData* in_data, PF_ParamDef* params[])
+{
+    if (!params) return PF_Err_NONE;
+    ParamDefaults d;   // start from the EXISTING file (preserves zoom_sync_offset_frames,
+    LoadDefaults(d);   // which has no UI param), then overwrite with the live values
+    if (params[kParamSmoothingStrength]) d.smoothing      = params[kParamSmoothingStrength]->u.fs_d.value;
+    if (params[kParamFocalLength])       d.focal          = params[kParamFocalLength]->u.fs_d.value;
+    if (params[kParamHorizonAmount])     d.horizonAmt     = params[kParamHorizonAmount]->u.fs_d.value;
+    if (params[kParamHorizonTilt])       d.horizonTilt    = params[kParamHorizonTilt]->u.fs_d.value;
+    if (params[kParamScaleToFill])       d.scaleToFill    = params[kParamScaleToFill]->u.bd.value;
+    if (params[kParamScaleFollowsZoom])  d.scaleFollows   = params[kParamScaleFollowsZoom]->u.fs_d.value;
+    if (params[kParamExtraScale])        d.extraScale     = params[kParamExtraScale]->u.fs_d.value;
+    if (params[kParamDebugLog])          d.debugLog       = params[kParamDebugLog]->u.bd.value;
+    // (rolling_shutter has no UI param — LoadDefaults above preserved the file's value)
+    const bool ok = SaveDefaults(d);
+    GyroLog("Saved defaults.ini: ok=%d smoothing=%.1f focal=%.1f scaleFollows=%.1f scaleToFill=%d",
+            (int)ok, d.smoothing, d.focal, d.scaleFollows, d.scaleToFill);
+    SetButtonLabel(in_data, params, kParamSaveDefault,
+                   ok ? "Saved (restart to apply)" : "Save FAILED (permissions?)");
     return PF_Err_NONE;
 }
 
@@ -483,7 +683,6 @@ static PF_Err Render(
         return ((params && params[idx]) ? params[idx]->u.bd.value : dflt) != 0;
     };
     float smoothingPct = fparam(kParamSmoothingStrength, kDefaultSmoothing);
-    float rsOverride   = fparam(kParamRollingShutter,    kDefaultRollingShutter);
     bool  scaleToFill  = bparam(kParamScaleToFill,       kDefaultScaleToFill);
     float focalParam   = fparam(kParamFocalLength,       kDefaultFocalLength);
     float horizonAmt   = fparam(kParamHorizonAmount,     kDefaultHorizonAmount);
@@ -519,9 +718,11 @@ static PF_Err Render(
                                         : 35.0f);
         // "Scale Follows Zoom" (0..100) eases the lens's hard zoom start/stop via a digital
         // zoom so the apparent focal follows a smoothed curve. Off under a manual fixed focal.
-        sp.zoomEaseScale      = (focalParam > 0.0f || !inst->brawReader)
-                                    ? 1.0f
-                                    : inst->brawReader->GetZoomEaseScale(timeSec, 1.2, scaleFollows / 100.0f);
+        float leadF = scaleFollows * 0.1f;               // %/10 frames of lead
+        if (leadF > 5.0f) leadF = 5.0f;                  // cap: pre/post easing beyond ~5 frames reads as pulsing
+        sp.zoomEaseScale      = (focalParam > 0.0f || scaleFollows <= 0.0f || !inst->brawReader)
+                                    ? 1.0f               // 0 = off, no calc
+                                    : inst->brawReader->GetZoomEaseScale(timeSec, leadF);
         sp.maxFocalLengthMM   = (focalParam > 0.0f)
                                     ? focalParam
                                     : (inst->brawReader
@@ -530,11 +731,9 @@ static PF_Err Render(
         sp.photositePitchUm   = inst->brawReader
                                     ? inst->brawReader->GetPhotositePitchUm()
                                     : 0.0f;
-        sp.rollingShutterMs   = (rsOverride > 0.0f)
-                                    ? rsOverride
-                                    : (inst->brawReader
-                                        ? inst->brawReader->GetRollingShutterMs()
-                                        : 16.0f);
+        sp.rollingShutterMs   = inst->brawReader
+                                    ? inst->brawReader->GetRollingShutterMs()   // incl. ini override
+                                    : 16.0f;
         warpMap = inst->gyroIntegrator->ComputeWarpMap(
             timeSec, sp, output ? output->width : 0, output ? output->height : 0);
     }
@@ -625,9 +824,20 @@ DllExport PREMPLUGENTRY EffectMain(
             break;
 
         case PF_Cmd_UPDATE_PARAMS_UI:       // auto refresh (best-effort)
-        case PF_Cmd_USER_CHANGED_PARAM:     // "Check support" button clicked (reliable)
             err = UpdateParamsUI(in_data, out_data, params);
             break;
+
+        case PF_Cmd_USER_CHANGED_PARAM: {   // a button was clicked (reliable)
+            PF_UserChangedParamExtra* uc = reinterpret_cast<PF_UserChangedParamExtra*>(extra);
+            if (uc && uc->param_index == kParamSaveDefault) {
+                err = SaveDefaultsFromParams(in_data, params);   // "Save settings"
+            } else {
+                if (uc && uc->param_index == kParamCheckUpdate)
+                    StartUpdateCheck();                          // async; label set via refresh
+                err = UpdateParamsUI(in_data, out_data, params); // refresh all status labels
+            }
+            break;
+        }
 
         default:
             break;

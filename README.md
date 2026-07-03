@@ -111,27 +111,30 @@ Apply **Video Effects → BRAW Tools → BRAW Gyro Stabilizer** to a BRAW clip a
 reads the gyro and stabilizes on its own. The controls are optional fine-tuning; most of
 the time you'll only reach for **Smoothing**.
 
-<p align="center">
-  <img src="assets/effect-controls.png" width="520"
-       alt="BRAW Gyro Stabilizer — Effect Controls in Premiere Pro">
-</p>
-
 | Control | Default | What it does |
 |---|---|---|
-| **Check support** (button) | — | Read-only. Shows the detected camera, or "Unsupported file" / "No gyro data in clip". |
-| Smoothing (%) | 20 | How much the shaky motion is smoothed out. `0` = no smoothing (only fixes rolling shutter); higher = steadier, more locked-off, but crops in further to cover the exposed edges. |
-| Focal Length Override (mm) | 0 = auto | Leave at 0 (auto-read per frame). Set a value only if the auto focal is wrong. |
-| Horizon Lock (%) | 0 = off | Level the horizon. 0 = off, 100 = fully level. |
-| Horizon Tilt (°) | 0 | Tilts the leveled horizon by this many degrees — for deliberately canted shots. Only matters when Horizon Lock is above 0. |
-| Scale to Fill | on | Auto-zoom to hide the empty edges the warp exposes. |
-| Scale Follows Zoom (%) | 100 | *Zoom lenses only.* Smooths the zoom **motion** — digitally eases a jerky or hard-stopping hand-zoom so it looks motorized. 0 = off (raw zoom); 100 = full smoothing (adds a small constant zoom-in as headroom). No effect on fixed-focal lenses. |
-| Extra Scale (%) | 0 | Optional manual zoom on top of the auto-crop. |
-| Rolling Shutter Override (ms) | 0 = auto | Leave at 0 (auto-read from the file). |
-| Debug Logging | off | Writes diagnostics to `/tmp/brawgyro.log`. |
-| **Render path** (button) | — | Read-only. Shows whether it's running on **GPU (Metal)** or **CPU (software)**. |
+| **Status row** (top, button) | — | Shows the detected camera — or **`!! NO GYRO DATA IN CLIP !!`** / **`!! UNSUPPORTED FILE !!`**. Press **Check** to refresh. |
+| Smoothing (%) | 50 | How much of the motion is smoothed away. `0` = rolling-shutter fix only; higher = steadier but crops in more. For moving (gimbal/pan) shots, higher values eat more frame — the deliberate move itself gets flattened. |
+| Focal Override (mm) | 0 = auto | Leave at 0 (auto-read per frame, tracks zoom lenses). Set the real value for manual lenses that report a wrong focal. |
+| **Horizon** → Lock (%) | 0 = off | Levels the horizon to true gravity (accelerometer-anchored). 0 = off, 100 = fully level. |
+| **Horizon** → Tilt (deg) | 0 | Holds the leveled horizon at this angle — for deliberately canted shots. Only matters when Lock > 0. |
+| **Scale** → Scale to Fill | on | Auto-zoom that hides the edges the warp exposes. Local and self-adjusting: calm sections sit near no-crop, hard hits get covered, and it holds steady (no pumping). |
+| **Scale** → Scale Follows Zoom (%) | 0 = off | *Zoom lenses only.* Smooths jerky / hard-stopping zoom **motion** so it reads like a motorized zoom. ~25 is a good working value. A slight scale lead-in/settle around the zoom is inherent to how this works. |
+| **Scale** → Extra Scale (%) | 0 | Manual digital zoom on top of the auto-crop. |
+| **Debug** → Debug Logging | off | Writes diagnostics to `/tmp/brawgyro.log`. |
+| **Debug** → Render path (button) | — | Shows whether it's running on **GPU (Metal)** or **CPU (software)**. |
+| **Debug** → Updates (button) | — | Checks GitHub for a newer release — only when clicked, never automatically. |
+| **Save settings** (button) | — | Saves the current values as the defaults for newly-applied instances (takes effect after a Premiere restart). |
 
 *Terminology:* "**zoom**" = the lens's optical zoom (focal length); "**scale**" = the
 plugin's digital crop.
+
+**Saved defaults & advanced tuning** live in a plain text file:
+`~/Library/Application Support/BRAWGyroStabilizer/defaults.ini` — written by **Save
+settings**, hand-editable. Two advanced keys have no UI control and are re-read live
+(no restart): `rolling_shutter` (ms, `0` = auto from the file's metadata) and
+`zoom_sync_offset_frames` (timing trim between the lens metadata and the picture for
+Scale Follows Zoom; default `1.2`).
 
 ---
 

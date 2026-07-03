@@ -523,7 +523,6 @@ public:
             StabilizationParams sp;
             sp.smoothingWindowSec = SmoothingPctToSigma((float)GetParam(kParamSmoothingStrength, t).mFloat64);
             bool  scaleToFill     = GetParam(kParamScaleToFill,  t).mBool != 0;
-            float rsOverride      = (float)GetParam(kParamRollingShutter,    t).mFloat64;
             float focalParam      = (float)GetParam(kParamFocalLength,       t).mFloat64;
             float horizonAmt      = (float)GetParam(kParamHorizonAmount,     t).mFloat64;
             float horizonTilt     = (float)GetParam(kParamHorizonTilt,       t).mFloat64;
@@ -547,11 +546,15 @@ public:
             // "Scale Follows Zoom" (0..100) eases the lens's hard zoom start/stop by digitally
             // zooming so the apparent focal follows a smoothed curve. Off when focal is a manual
             // fixed override (no zoom to ease).
-            sp.zoomEaseScale    = (focalParam > 0.0f) ? 1.0f
-                                                     : reader->GetZoomEaseScale(timeSec, 1.2, scaleFollows / 100.0f);
+            float leadF = scaleFollows * 0.1f;               // %/10 frames of lead
+            if (leadF > 5.0f) leadF = 5.0f;                  // cap: pre/post easing beyond ~5 frames
+                                                             // reads as pulsing (physics: corner
+                                                             // smoothing NEEDS pre/post motion)
+            sp.zoomEaseScale    = (focalParam > 0.0f || scaleFollows <= 0.0f)   // 0 = off, no calc
+                                      ? 1.0f : reader->GetZoomEaseScale(timeSec, leadF);
             sp.maxFocalLengthMM = (focalParam > 0.0f) ? focalParam : reader->GetMaxFocalLength();
             sp.photositePitchUm = reader->GetPhotositePitchUm();
-            sp.rollingShutterMs = (rsOverride > 0.0f) ? rsOverride : reader->GetRollingShutterMs();
+            sp.rollingShutterMs = reader->GetRollingShutterMs();   // incl. defaults.ini override
             wm = gyro->ComputeWarpMap(timeSec, sp, width, height);
 
             // Diagnostic: log whenever the Smoothing slider value reaching the GPU

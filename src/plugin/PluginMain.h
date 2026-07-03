@@ -39,36 +39,54 @@
 // changed to match exactly — the GPU reads by these enum values, so the two MUST agree.
 // (A mismatch silently misreads every value: crop still runs but rotation is garbage.)
 enum {
-    kParamStatus            = 1,   // "Check support" button; its label shows camera / unsupported (UI-only, GPU ignores)
+    kParamStatus            = 1,   // top-level STATUS row (the no-gyro notification): its label
+                                   // shows the camera / "No gyro data in clip"; button refreshes
     kParamSmoothingStrength = 2,   // Smoothing %, mapped non-linearly to a seconds-sigma
     kParamFocalLength       = 3,   // focal length override (mm), 0 = auto — important, near top
-    kParamHorizonAmount     = 4,   // horizon leveling %, 0 = off
-    kParamHorizonTilt       = 5,   // target horizon angle (degrees); 0 = level
-    kParamScaleToFill       = 6,   // "Scale to Fill" — digital crop is computed automatically
-    kParamScaleFollowsZoom  = 7,   // "Scale Follows Zoom %": digital zoom-MOTION easing (0 = off, 100 = full)
-    kParamExtraScale        = 8,   // "Extra Scale %" — manual digital zoom on top of the auto-crop
-    kParamRollingShutter    = 9,   // rolling-shutter readout override (ms), 0 = auto
-    kParamDebugLog          = 10,  // write /tmp/brawgyro.log when on (off = no logging)
-    kParamRenderPath        = 11,  // "Check" button; label shows GPU vs CPU render path (UI-only)
+    kParamHorizonGroup      = 4,   // "Horizon" group header (topic; UI-only, occupies an index)
+    kParamHorizonAmount     = 5,   // horizon leveling %, 0 = off
+    kParamHorizonTilt       = 6,   // target horizon angle (degrees); 0 = level
+    kParamHorizonGroupEnd   = 7,   // group end (UI-only, occupies an index)
+    kParamScaleGroup        = 8,   // "Scale" group header (topic; UI-only)
+    kParamScaleToFill       = 9,   // "Scale to Fill" — digital crop is computed automatically
+    kParamScaleFollowsZoom  = 10,  // "Scale Follows Zoom %": digital zoom-MOTION easing (0 = off)
+    kParamExtraScale        = 11,  // "Extra Scale %" — manual digital zoom on top of the auto-crop
+    kParamScaleGroupEnd     = 12,  // group end (UI-only)
+    kParamDebugGroup        = 13,  // "Debug" group header (topic, ships COLLAPSED; UI-only)
+    kParamDebugLog          = 14,  // write /tmp/brawgyro.log when on (off = no logging)
+    kParamRenderPath        = 15,  // "Check" button; label shows GPU vs CPU render path (UI-only)
+    kParamCheckUpdate       = 16,  // "Check" button; queries GitHub for a newer release (UI-only;
+                                   // network ONLY on click, async — never blocks the UI thread)
+    kParamDebugGroupEnd     = 17,  // group end (UI-only)
+    kParamSaveDefault       = 18,  // "Save settings" button; writes current values to defaults.ini (UI-only)
+    // NOTE: the Rolling Shutter Override param was removed from the UI — the override now
+    // lives only in defaults.ini ("rolling_shutter", ms, 0 = auto) and is applied inside
+    // BRAWReader::GetRollingShutterMs().
 };
 
 // Longest status text fits PF_MAX_EFFECT_PARAM_NAME_LEN (31). Keep messages short.
-static constexpr char kStatusDefault[]     = "Press Check to detect file";
-static constexpr char kRenderPathDefault[] = "Render: press Check";
+static constexpr char kStatusDefault[]      = "Press Check to detect file";
+static constexpr char kRenderPathDefault[]  = "Render: press Check";
+static constexpr char kCheckUpdateDefault[] = "Updates: press Check";
+// Plugin version, compared against the newest GitHub release tag by the update check.
+// Keep in sync with CMakeLists project(VERSION) / package.sh VERSION.
+static constexpr char kPluginVersionStr[]   = "1.1.0";
 // Smoothing slider (%) → Gaussian sigma in seconds. Square curve so the perceptually busy
-// low end is spread across the slider and 5–10s dead-zone is gone (max ~5s at 100%).
+// low end is spread across the slider. Max sigma 1.25s at 100% — the old 5s top turned a
+// deliberate camera move into "shake" and demanded huge crops; the usable range in practice
+// was the old 0–50, which is now the full dial.
 inline float SmoothingPctToSigma(float pct) {
     float p = (pct < 0.f ? 0.f : (pct > 100.f ? 100.f : pct)) / 100.f;
-    return 5.0f * p * p;
+    return 1.25f * p * p;
 }
 
-static constexpr float kDefaultSmoothing      = 20.0f;  // % (→ ~0.2s sigma via the curve)
+static constexpr float kDefaultSmoothing      = 50.0f;  // % (→ ~0.31s sigma)
 static constexpr float kDefaultRollingShutter = 0.0f;   // ms, 0 = auto (BRAW metadata)
 static constexpr int   kDefaultScaleToFill    = 1;
 static constexpr float kDefaultFocalLength    = 0.0f;   // mm, 0 = auto (read from clip)
 static constexpr float kDefaultHorizonAmount  = 0.0f;   // horizon leveling %, 0 = off
 static constexpr float kDefaultHorizonTilt    = 0.0f;   // target horizon angle (degrees)
-static constexpr float kDefaultScaleFollowsZoom = 100.0f; // % — 100 = full zoom-motion easing
+static constexpr float kDefaultScaleFollowsZoom = 0.0f;  // % — zoom-motion easing OFF by default (~25 is a good working value)
 static constexpr float kDefaultExtraScale     = 0.0f;   // % extra digital zoom on top of the auto-crop
 static constexpr int   kDefaultDebugLog       = 0;      // debug logging off by default
 

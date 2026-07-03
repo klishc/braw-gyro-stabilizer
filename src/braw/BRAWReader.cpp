@@ -45,6 +45,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <sys/stat.h>
 
 // ── Process-global focal cache (keyed by clip path) ───────────────────────────
 // Premiere opens the same .braw through several BRAWReaders (the CPU EffectMain path
@@ -627,17 +628,18 @@ float BRAWReader::GetFocalLength(double timeSec) const
 
 float BRAWReader::GetFocalLengthSmoothed(double timeSec, double windowSec) const
 {
-    // Gaussian-weighted average of the focal track over [t-window, t+window]. It's SYMMETRIC
-    // (uses future samples too), so there's no lag — the sharp velocity corner where a zoom
-    // starts or stops gets rounded on both sides, and the digital scale eases through it.
-    // The focal track is fully known ahead of time, so future sampling is free.
+    // CAUSAL (past-only) Gaussian over [t-window, t]. Deliberately one-sided: a symmetric window
+    // looks into the future, which made the digital scale START MOVING BEFORE a crash zoom
+    // (anticipation) and then hitch as the real zoom overtook it. Past-only has no anticipation —
+    // the zoom starts on time and only its TAIL (the hard stop) is eased, at the cost of a little
+    // lag. The full focal track is known, but we still only read backwards here on purpose.
     if (windowSec <= 1e-3 || !(mFocalReady.load() && mFocalTrack.size() > 2))
         return GetFocalLength(timeSec);
-    const int    half  = 12;                 // samples per side
-    const double sigma = windowSec * 0.5;    // ±window ≈ ±2σ
+    const int    n     = 24;                 // samples across the past window
+    const double sigma = windowSec * 0.5;
     double num = 0.0, den = 0.0;
-    for (int i = -half; i <= half; ++i) {
-        const double dt = (windowSec / half) * i;
+    for (int i = -n; i <= 0; ++i) {
+        const double dt = (windowSec / n) * i;   // dt in [-window, 0]
         const double w  = std::exp(-(dt * dt) / (2.0 * sigma * sigma));
         num += w * GetFocalLength(timeSec + dt);
         den += w;
@@ -646,38 +648,122 @@ float BRAWReader::GetFocalLengthSmoothed(double timeSec, double windowSec) const
 }
 
 
-float BRAWReader::GetZoomEaseScale(double timeSec, double windowSec, float blend) const
+// ── Hot-reloaded tuning values from defaults.ini ──────────────────────────────
+// Advanced values with no UI param, hand-tunable WITHOUT rebuild or restart via
+//   ~/Library/Application Support/BRAWGyroStabilizer/defaults.ini
+// The file's mtime is checked each call, so edits apply on the next rendered frame.
+//   zoom_sync_offset_frames — the focal metadata can run a frame or so AHEAD of the
+//     picture (lens servo + exposure); the zoom-ease curve is delayed by this many
+//     frames to cancel what's VISIBLE (negative = metadata lags).
+//   rolling_shutter — sensor readout override in ms; 0 = auto (BRAW metadata).
+struct IniTune { float zoomSyncFrames = 1.2f; float rollingShutterMs = 0.f; };
+static IniTune GetIniTune()
 {
-    // Make the APPARENT focal follow appFocal = lerp(actual, smoothed, blend), by returning
-    // the digital magnification appFocal/actual. Normalize by the clip-wide MIN of that ratio
-    // so the result is always >= 1 (the widest-needed frame sits at the base crop and never
-    // shows past the frame; every other frame just zooms in a touch). The overall constant
-    // 1/minRatio is the ease "headroom" — the price of decelerating the hard stops.
-    if (blend <= 1e-3f || windowSec <= 1e-3 || !(mFocalReady.load() && mFocalTrack.size() > 2))
-        return 1.0f;
-
-    {   // clip-wide min appFocal/actual, cached per (blend,window)
-        std::lock_guard<std::mutex> lk(mZoomEaseMutex);
-        if (!mZoomEaseValid || mZoomEaseBlend != blend || mZoomEaseWindow != (float)windowSec) {
-            float mn = 1e9f;
-            for (const auto& p : mFocalTrack) {
-                const float act = p.second;
-                if (act < 1e-3f) continue;
-                const float sm  = GetFocalLengthSmoothed(p.first, windowSec);
-                const float app = act + blend * (sm - act);
-                mn = std::min(mn, app / act);
-            }
-            mZoomEaseMinRatio = (mn > 1e-3f && mn < 1e8f) ? mn : 1.0f;
-            mZoomEaseBlend  = blend;
-            mZoomEaseWindow = (float)windowSec;
-            mZoomEaseValid  = true;
+    static std::mutex sM;
+    static IniTune sVal;
+    static long    sMtime = -1;
+    std::lock_guard<std::mutex> lk(sM);
+    const char* home = std::getenv("HOME");
+    if (!home) return sVal;
+    const std::string path = std::string(home) +
+        "/Library/Application Support/BRAWGyroStabilizer/defaults.ini";
+    struct stat st {};
+    if (::stat(path.c_str(), &st) != 0) return sVal;
+    if ((long)st.st_mtime == sMtime) return sVal;
+    sMtime = (long)st.st_mtime;
+    if (FILE* f = std::fopen(path.c_str(), "r")) {
+        char line[256]; double v = 0.0;
+        auto clampf = [](double x, float lo, float hi) {
+            if (!(x == x)) return lo;                        // NaN guard
+            return (float)std::min((double)hi, std::max((double)lo, x));
+        };
+        while (std::fgets(line, sizeof line, f)) {
+            // Clamp to sane ranges — a hand-edited file must never produce a wild warp.
+            if      (std::sscanf(line, " zoom_sync_offset_frames = %lf", &v) == 1) sVal.zoomSyncFrames  = clampf(v, -10.f, 10.f);
+            else if (std::sscanf(line, " rolling_shutter = %lf",          &v) == 1) sVal.rollingShutterMs = clampf(v,   0.f, 50.f);
         }
+        std::fclose(f);
+    }
+    return sVal;
+}
+static float ZoomSyncOffsetFrames() { return GetIniTune().zoomSyncFrames; }
+
+
+float BRAWReader::GetRollingShutterMs() const
+{
+    // Metadata readout time, unless overridden via defaults.ini ("rolling_shutter" > 0).
+    const float ov = GetIniTune().rollingShutterMs;
+    return (ov > 0.f) ? ov : mRollingShutterMs;
+}
+
+
+float BRAWReader::GetZoomEaseScale(double timeSec, float leadFrames) const
+{
+    // UPPER-ENVELOPE ease, computed in LOG-focal space. Perceived zoom is MULTIPLICATIVE
+    // (a 24→30mm move looks like a 48→60), so the envelope and its smoothing run on ln(focal):
+    // that makes the eased zoom's per-frame RATIO profile a clean bell — smoothing in linear
+    // focal left the release perceptually lumpy (uneven %-per-frame = the residual wobble).
+    //
+    // Shape: apparent focal = smooth local MAX of ln(focal) over ±leadFrames. Max ⇒ always
+    // >= the real focal ⇒ crop >= 1 (never shows beyond the frame), a SINGLE bump per zoom,
+    // and exactly 1.0 in flat regions (no cushion; slow smooth zooms are left untouched).
+    // It leads a zoom-in by a few frames, tracks the move in sync, then releases.
+    if (leadFrames < 0.5f || mFrameRate < 1.f || !(mFocalReady.load() && mFocalTrack.size() > 2))
+        return 1.0f;
+    const double windowSec = (double)leadFrames / (double)mFrameRate;
+
+    std::lock_guard<std::mutex> lk(mZoomEaseMutex);
+    if (!mZoomEaseValid || mZoomEaseWindow != (float)windowSec) {
+        const long N = (long)mFocalTrack.size();
+        // 1) ln(focal) per sample
+        std::vector<double> lf((size_t)N);
+        for (long i = 0; i < N; ++i)
+            lf[(size_t)i] = std::log(std::max(1e-3f, mFocalTrack[(size_t)i].second));
+        // 2) local MAX of ln(focal) within ±windowSec of each sample
+        std::vector<double> env((size_t)N);
+        for (long i = 0; i < N; ++i) {
+            const double t = mFocalTrack[(size_t)i].first;
+            double mx = lf[(size_t)i];
+            for (long j = i - 1; j >= 0 && mFocalTrack[(size_t)j].first >= t - windowSec; --j) mx = std::max(mx, lf[(size_t)j]);
+            for (long j = i + 1; j < N  && mFocalTrack[(size_t)j].first <= t + windowSec; ++j) mx = std::max(mx, lf[(size_t)j]);
+            env[(size_t)i] = mx;
+        }
+        // 3) triangular smoothing of the ln-envelope (radius <= window keeps env >= ln f, so
+        //    the ratio below stays >= 1 by construction), then cache the per-sample EASE RATIO
+        //    exp(envLn - lnF) — one track, one interpolation, no separate denominator.
+        const int h = std::max(1, (int)std::lround(leadFrames * 0.5f));
+        mZoomEaseTrack.resize((size_t)N);
+        for (long i = 0; i < N; ++i) {
+            double s = 0.0, w = 0.0;
+            for (int d = -h; d <= h; ++d) {
+                const long k = i + d;
+                if (k < 0 || k >= N) continue;
+                const double ww = 1.0 - (double)std::abs(d) / (h + 1);
+                s += ww * env[(size_t)k]; w += ww;
+            }
+            const double envLn = (w > 0.0) ? s / w : env[(size_t)i];
+            mZoomEaseTrack[(size_t)i] = std::make_pair(mFocalTrack[(size_t)i].first,
+                                                       (float)std::exp(envLn - lf[(size_t)i]));
+        }
+        mZoomEaseWindow = (float)windowSec;
+        mZoomEaseValid  = true;
     }
 
-    const float act = GetFocalLength(timeSec);
-    if (act < 1e-3f) return 1.0f;
-    const float sm    = GetFocalLengthSmoothed(timeSec, windowSec);
-    const float app   = act + blend * (sm - act);
-    const float scale = (app / act) / mZoomEaseMinRatio;   // >= 1 by construction
-    return std::max(1.0f, scale);
+    // Evaluate at the PICTURE's clock: the visible image corresponds to metadata from
+    // zoom_sync_offset_frames ago (~0.5 = mid-exposure). Pure time shift — flats stay 1.
+    const double tEval = timeSec - (double)ZoomSyncOffsetFrames() / (double)mFrameRate;
+
+    const auto& T = mZoomEaseTrack;
+    if (T.empty()) return 1.0f;
+    float ease;
+    if      (tEval <= T.front().first) ease = T.front().second;
+    else if (tEval >= T.back().first)  ease = T.back().second;
+    else {
+        size_t lo = 0, hi = T.size() - 1;
+        while (hi - lo > 1) { size_t m = (lo + hi) / 2; if (T[m].first <= tEval) lo = m; else hi = m; }
+        const double span = T[hi].first - T[lo].first;
+        const float  a    = (span > 1e-9) ? (float)((tEval - T[lo].first) / span) : 0.f;
+        ease = T[lo].second + a * (T[hi].second - T[lo].second);
+    }
+    return std::max(1.0f, ease);
 }
